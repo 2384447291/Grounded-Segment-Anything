@@ -2,3 +2,4 @@ from .shared_memory_queue import SharedMemoryQueue
 from .shared_memory_ring_buffer import SharedMemoryRingBuffer
 from .shared_ndarray import SharedNDArray
 from .shared_memory_util import SharedAtomicCounter, ArraySpec
+from .pubsub_manager import PubSubManager

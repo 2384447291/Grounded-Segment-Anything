@@ -11,11 +11,8 @@ if project_root not in sys.path:
 import numpy as np
 import torch
 from PIL import Image
-import cv2
 import logging
 import time
-from multiprocessing.managers import BaseManager
-from queue import Empty
 
 
 
@@ -32,11 +29,11 @@ from GroundingDINO.groundingdino.util.utils import clean_state_dict
 # Segment Anything imports
 from segment_anything import sam_hq_model_registry, SamPredictor
 
-# Shared Memory Queue
-from shm_lib.shared_memory_queue import SharedMemoryQueue
+# PubSub Manager
+from shm_lib.pubsub_manager import PubSubManager
 
 # --- Helper Functions ---
-port = 5000   
+port = 10000   
 
 def decode_text_prompt(encoded_array: np.ndarray) -> str:
     """Decode a numpy array back to a string."""
@@ -91,15 +88,89 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold, d
     # The client doesn't need phrases, so we just return the boxes.
     return boxes_filt
 
-# --- Shared Memory Manager ---
+# --- PubSub Topic Names ---
+REQUEST_TOPIC = "segmentation_requests"
+MASK_TOPIC = "segmentation_masks"
 
-class QueueManager(BaseManager):
-    """Manager to handle shared memory queues over the network."""
-    pass
+# Global references for use in handler
+pubsub_instance = None
+dino_model_instance = None
+predictor_instance = None
+device_instance = None
+box_threshold_instance = None
+
+def process_segmentation_request(data):
+    """Process segmentation request and send back mask result."""
+    global pubsub_instance, dino_model_instance, predictor_instance, device_instance, box_threshold_instance
+    
+    try:
+        # Extract image and prompt info
+        rgb_image_np = data['rgb']
+        text_prompt = decode_text_prompt(data['prompt'])
+        logging.info(f"Processing request with prompt: '{text_prompt}', image_shape={rgb_image_np.shape}")
+        
+        H, W, _ = rgb_image_np.shape
+
+        # Run GroundingDINO to get boxes
+        image_tensor = prepare_image_for_dino(rgb_image_np, device_instance)
+        text_threshold = 0.25  # Value from test.py
+        boxes = get_grounding_output(
+            dino_model_instance, image_tensor, text_prompt, box_threshold_instance, text_threshold, device=device_instance
+        )
+
+        if boxes.size(0) == 0:
+            logging.warning("No objects detected. Returning an empty mask.")
+            empty_mask = np.zeros((H, W), dtype=bool)
+            pubsub_instance.publish(MASK_TOPIC, {'mask': empty_mask})
+            return
+        
+        # Prepare boxes for SAM (cxcywh -> xyxy format)
+        boxes_xyxy = boxes.clone()
+        boxes_xyxy[:, 0] = (boxes[:, 0] - boxes[:, 2] / 2) * W
+        boxes_xyxy[:, 1] = (boxes[:, 1] - boxes[:, 3] / 2) * H
+        boxes_xyxy[:, 2] = (boxes[:, 0] + boxes[:, 2] / 2) * W
+        boxes_xyxy[:, 3] = (boxes[:, 1] + boxes[:, 3] / 2) * H
+        
+        # Run SAM predictor to get masks
+        predictor_instance.set_image(rgb_image_np)
+        transformed_boxes = predictor_instance.transform.apply_boxes_torch(boxes_xyxy, (H, W)).to(device_instance)
+
+        masks, _, _ = predictor_instance.predict_torch(
+            point_coords=None,
+            point_labels=None,
+            boxes=transformed_boxes,
+            multimask_output=False,
+        )
+        
+        # Combine masks and send the result back
+        final_mask = torch.any(masks, dim=0).squeeze(0).cpu().numpy()
+        success = pubsub_instance.publish(MASK_TOPIC, {'mask': final_mask})
+        
+        if success:
+            process_segmentation_request.count += 1
+            if process_segmentation_request.count % 10 == 0:
+                logging.info(f"Processed and sent {process_segmentation_request.count} segmentation results")
+        
+        logging.info("Processed request and sent segmentation mask.")
+        
+    except Exception as e:
+        logging.error(f"Error processing segmentation request: {e}", exc_info=True)
+        # Send empty mask on error
+        try:
+            H, W = data['rgb'].shape[:2]
+            empty_mask = np.zeros((H, W), dtype=bool)
+            pubsub_instance.publish(MASK_TOPIC, {'mask': empty_mask})
+        except:
+            pass
+
+# Initialize counter
+process_segmentation_request.count = 0
 
 # --- Main Client Logic ---
 
 def main():
+    global pubsub_instance, dino_model_instance, predictor_instance, device_instance, box_threshold_instance
+    
     # --- Configuration ---
     config_file = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
     grounded_checkpoint = "groundingdino_swint_ogc.pth"
@@ -114,78 +185,63 @@ def main():
     dino_model = load_grounding_dino_model(config_file, grounded_checkpoint, bert_base_uncased_path, device=device)
     predictor = SamPredictor(sam_hq_model_registry[sam_version](checkpoint=sam_hq_checkpoint).to(device))
     logging.info("Models loaded successfully.")
-
-    # --- Connect to Shared Memory Server ---
-    logging.info(f"Connecting to Shared Memory server at 127.0.0.1:{port}...")
-    QueueManager.register('get_req_queue')
-    QueueManager.register('get_res_queue')
     
-    manager = QueueManager(address=('127.0.0.1', port), authkey=b'foundationpose')
-    manager.connect()
-    logging.info("Connected to server.")
+    # Store global references for handler
+    dino_model_instance = dino_model
+    predictor_instance = predictor
+    device_instance = device
+    box_threshold_instance = box_threshold
 
-    req_queue = manager.get_req_queue()
-    res_queue = manager.get_res_queue()
+    # --- Setup PubSub Manager ---
+    logging.info(f"Setting up PubSub manager on port {port}...")
+    pubsub = PubSubManager(port=port, authkey=b'foundationpose')
+    pubsub_instance = pubsub  # Store global reference
+    
+    # Setup as both publisher and subscriber
+    pubsub.start(role='both')
+    
+    # Setup subscriber with topic configurations
+    topics_config = {
+        REQUEST_TOPIC: {
+            'examples': {
+                'rgb': np.zeros((480, 640, 3), dtype=np.uint8),
+                'prompt': np.zeros(256, dtype=np.uint8)
+            },
+            'buffer_size': 50,
+            'mode': 'consumer'  # 请求使用消费者模式，确保每个请求只被处理一次
+        },
+        MASK_TOPIC: {
+            'examples': {
+                'mask': np.zeros((480, 640), dtype=bool)
+            },
+            'buffer_size': 50,
+            'mode': 'consumer'  # 结果使用消费者模式，确保每个结果只被读取一次
+        }
+    }
+    
+    # Setup subscriber with topic configurations
+    pubsub.setup_subscriber(topics_config)
+    
+    logging.info("PubSub topics created and ready.")
 
+    print("Starting segmentation processor...")
+    print("Listening for requests and sending back mask results...")
+    
+    # Register handler for segmentation requests - PubSub will automatically manage the listener thread!
+    pubsub.register_topic_handler(REQUEST_TOPIC, process_segmentation_request, check_interval=0.001)
+    
     # --- Main Processing Loop ---
     logging.info("Client is ready. Waiting for segmentation requests...")
-    while True:
-        try:
-            # Get request from the server
-            req_data = req_queue.get()
-            
-            rgb_image_np = req_data['rgb']
-            text_prompt = decode_text_prompt(req_data['prompt'])
-            logging.info(f"Received request with prompt: '{text_prompt}'")
-            H, W, _ = rgb_image_np.shape
-
-            # Run GroundingDINO to get boxes
-            image_tensor = prepare_image_for_dino(rgb_image_np, device)
-            text_threshold = 0.25 # Value from test.py
-            boxes = get_grounding_output(
-                dino_model, image_tensor, text_prompt, box_threshold, text_threshold, device=device
-            )
-
-            if boxes.size(0) == 0:
-                logging.warning("No objects detected. Returning an empty mask.")
-                empty_mask = np.zeros((H, W), dtype=bool)
-                res_queue.put({'mask': empty_mask})
-                continue
-            
-            # Prepare boxes for SAM (cxcywh -> xyxy format)
-            boxes_xyxy = boxes.clone()
-            boxes_xyxy[:, 0] = (boxes[:, 0] - boxes[:, 2] / 2) * W
-            boxes_xyxy[:, 1] = (boxes[:, 1] - boxes[:, 3] / 2) * H
-            boxes_xyxy[:, 2] = (boxes[:, 0] + boxes[:, 2] / 2) * W
-            boxes_xyxy[:, 3] = (boxes[:, 1] + boxes[:, 3] / 2) * H
-            
-            # Run SAM predictor to get masks
-            predictor.set_image(rgb_image_np)
-            transformed_boxes = predictor.transform.apply_boxes_torch(boxes_xyxy, (H, W)).to(device)
-
-            masks, _, _ = predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=transformed_boxes,
-                multimask_output=False,
-            )
-            
-            # Combine masks and send the result back
-            final_mask = torch.any(masks, dim=0).squeeze(0).cpu().numpy()
-            res_queue.put({'mask': final_mask})
-            logging.info("Processed request and sent segmentation mask.")
-
-        except (ConnectionResetError, BrokenPipeError, EOFError):
-            logging.warning("Connection to the server was lost. Shutting down client.")
-            break
-        except (KeyboardInterrupt, SystemExit):
-            logging.info("Client shutting down by user.")
-            break
-        except Exception as e:
-            logging.error(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
-            break # Exit on any other critical error
-            
-    logging.info("Client has shut down.")
+    try:
+        print("Segmentation processor is running. Press Ctrl+C to stop...")
+        while True:
+            time.sleep(1.0)
+                
+    except KeyboardInterrupt:
+        logging.info("Client shutting down by user.")
+    finally:
+        pubsub.stop(role='both')
+        logging.info("Client has shut down.")
 
 if __name__ == '__main__':
     import os

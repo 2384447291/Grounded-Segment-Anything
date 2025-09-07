@@ -37,3 +37,21 @@ class SharedAtomicCounter:
     def add(self, value: int):
         with atomicview(buffer=self.buf, atype=UINT) as a:
             a.add(value, order=MemoryOrder.ACQ_REL)
+
+
+def encode_text_prompt(text: str, max_length: int = 256) -> np.ndarray:
+    """Encode a string into a fixed-size numpy array."""
+    encoded = text.encode('utf-8')
+    if len(encoded) > max_length:
+        raise ValueError("Prompt is too long.")
+    
+    buffer = np.zeros(max_length, dtype=np.uint8)
+    buffer[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+    return buffer
+
+def decode_text_prompt(encoded_array: np.ndarray) -> str:
+    """Decode a numpy array back to a string."""
+    null_idx = np.where(encoded_array == 0)[0]
+    if len(null_idx) > 0:
+        encoded_array = encoded_array[:null_idx[0]]
+    return encoded_array.tobytes().decode('utf-8')

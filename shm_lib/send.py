@@ -1,71 +1,143 @@
+import os
+import sys
 import time
 import numpy as np
-from multiprocessing.managers import SharedMemoryManager, BaseManager
-from shm_lib import SharedMemoryQueue
-import multiprocessing as mp
+import logging
 
-# Define a manager class to host the shared memory queue
-class QueueManager(BaseManager):
-    pass
+# Add parent directory to path so we can import shm_lib
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+from shm_lib.pubsub_manager import PubSubManager
+
+def encode_text_prompt(text: str, max_length: int = 256) -> np.ndarray:
+    """Encode a string into a fixed-size numpy array."""
+    encoded = text.encode('utf-8')
+    if len(encoded) > max_length:
+        raise ValueError("Prompt is too long.")
+    
+    buffer = np.zeros(max_length, dtype=np.uint8)
+    buffer[:len(encoded)] = np.frombuffer(encoded, dtype=np.uint8)
+    return buffer
+
+def generate_request_data():
+    """Generate test request data."""
+    # Create test image
+    rgb_image = np.random.randint(0, 256, size=(480, 640, 3), dtype=np.uint8)
+    
+    # Cycle through different prompts
+    prompts = [
+        "a yellow and black utility knife",
+        "red apple", 
+        "blue car",
+        "green tree"
+    ]
+    prompt_text = prompts[generate_request_data.counter % len(prompts)]
+    prompt_encoded = encode_text_prompt(prompt_text)
+    
+    generate_request_data.counter += 1
+    
+    return {
+        'rgb': rgb_image,
+        'prompt': prompt_encoded
+    }
+
+# Initialize counter
+generate_request_data.counter = 0
+
+def print_stats(frame_count, start_time, success):
+    """Custom stats callback for high-speed testing."""
+    if success:
+        # Print real-time rate every 10 items
+        if frame_count % 10 == 0:
+            current_time = time.time()
+            fps = frame_count / (current_time - start_time)
+            print(f"Rate: {fps:.1f}/s", end='\r', flush=True)
+        
+        # Print detailed stats every 100 items
+        if frame_count % 100 == 0:
+            current_time = time.time()
+            fps = frame_count / (current_time - start_time)
+            print(f"\nPublished {frame_count} items, rate: {fps:.2f}/s")
+
+def handle_mask_result(data):
+    """Handle received mask results."""
+    mask = data['mask']
+    handle_mask_result.count += 1
+    
+    if handle_mask_result.count % 10 == 0:
+        non_zero_pixels = np.sum(mask)
+        print(f"Received mask #{handle_mask_result.count}, non-zero pixels: {non_zero_pixels}")
+
+# Initialize counter
+handle_mask_result.count = 0
 
 def main():
-    # Start a shared memory manager
-    with SharedMemoryManager() as shm_manager:
-        # Create an example piece of data to determine the queue's structure
-        example = {
-            'rgb': np.zeros((480, 640, 3), dtype=np.uint8),
-            'timestamp': 0.0
+    # Configuration
+    port = 10000
+    REQUEST_TOPIC = "segmentation_requests"
+    MASK_TOPIC = "segmentation_masks"
+    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s] - %(message)s')
+    
+    # Create PubSub manager
+    pubsub = PubSubManager(port=port, authkey=b'foundationpose')
+    
+    # Setup as both publisher and subscriber
+    pubsub.start(role='both')
+    
+    # Configure topics for both sending and receiving
+    topics_config = {
+        REQUEST_TOPIC: {
+            'examples': {
+                'rgb': np.zeros((480, 640, 3), dtype=np.uint8),
+                'prompt': np.zeros(256, dtype=np.uint8)
+            },
+            'buffer_size': 50
+        },
+        MASK_TOPIC: {
+            'examples': {
+                'mask': np.zeros((480, 640), dtype=bool)
+            },
+            'buffer_size': 50
         }
-        
-        # Create the shared memory queue
-        queue = SharedMemoryQueue.create_from_examples(
-            shm_manager=shm_manager,
-            examples=example,
-            buffer_size=10
-        )
-
-        # Register the queue with our custom manager
-        QueueManager.register('get_queue', callable=lambda: queue)
-        
-        # Start the manager server
-        manager = QueueManager(address=('', 50000), authkey=b'abc')
-        server = manager.get_server()
-        
-        # Start the server in a separate process
-        server_process = mp.Process(target=server.serve_forever)
-        server_process.daemon = True
-        server_process.start()
-        
-        print("Server started at port 50000")
-        
-        # In a loop, put data into the queue
+    }
+    
+    pubsub.setup_subscriber(topics_config)
+    
+    # Create topics for publishing
+    for topic_name, config in topics_config.items():
+        pubsub.create_topic(topic_name, config['examples'], config['buffer_size'])
+    
+    print("Starting bidirectional communication...")
+    print("Sending requests and listening for mask results...")
+    
+    # Main thread: send requests and get mask results
+    try:
         frame_count = 0
         start_time = time.time()
-        try:
-            while True:
-                data = {
-                    'rgb': np.random.randint(0, 256, size=(480, 640, 3), dtype=np.uint8),
-                    'timestamp': time.time()
-                }
-                try:
-                    queue.put(data)
-                    frame_count += 1
-                    if frame_count % 100 == 0:
-                        end_time = time.time()
-                        fps = frame_count / (end_time - start_time)
-                        print(f"Sender FPS: {fps:.2f}")
-                        frame_count = 0
-                        start_time = time.time()
-
-                except Exception as e:
-                    # print(f"Queue is full, skipping.")
-                    time.sleep(0.001) # wait a bit if queue is full
-                
-        except KeyboardInterrupt:
-            print("Shutting down...")
-        finally:
-            server_process.terminate()
-
+        
+        while True:
+            # Generate and send request
+            request_data = generate_request_data()
+            success = pubsub.publish(REQUEST_TOPIC, request_data)
+            
+            if success:
+                frame_count += 1
+                print_stats(frame_count, start_time, success)
+            
+            # Get latest mask result every 1 second
+            mask_data = pubsub.get_latest_data(MASK_TOPIC)
+            if mask_data is not None:
+                handle_mask_result(mask_data)
+            
+            time.sleep(1.0)  # Check every 1 second
+            
+    except KeyboardInterrupt:
+        print("\nSender shutting down...")
+    finally:
+        pubsub.stop(role='both')
 
 if __name__ == '__main__':
     main()
